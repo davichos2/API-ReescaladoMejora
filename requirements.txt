@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+watchfiles
+moviepy==1.0.3
+opencv-python
+numpy
+Pillow
+tqdm
+python-dotenv
