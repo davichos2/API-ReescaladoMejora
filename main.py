@@ -10,16 +10,14 @@ import re
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from moviepy.editor import VideoFileClip
+from moviepy import VideoFileClip
 import cv2
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from PIL import Image
 from tqdm import tqdm
-
-# Asumiendo que estos archivos existen en tu proyecto y están en el mismo directorio
-from models import ESPCN
+from RealESRGAN import RealESRGAN
 from utils import convert_ycbcr_to_rgb
 
 # --- CONFIGURACIÓN DE DIRECTORIOS Y COMPRESIÓN ---
@@ -29,7 +27,7 @@ PROCESSEDDIR = os.path.join(BASE_DIR, "Process/")
 AUXDIR_INPUT = os.path.join(BASE_DIR, "auxiliar/input/")
 AUXDIR_OUTPUT = os.path.join(BASE_DIR, "auxiliar/output/")
 FINALDIR = os.path.join(BASE_DIR, "FinalCompressed/")
-WEIGHTS_PATH = os.path.join(BASE_DIR, 'weights/espcn_x3.pth')
+WEIGHTS_PATH = os.path.join(BASE_DIR, 'weights/RealESRGAN_x2.pth')
 
 PRESET_NVENC = 'p5'
 CQ_VALUE = '31'
@@ -111,60 +109,131 @@ def cleanup_files(files_to_delete: list):
 # --- ENDPOINT PRINCIPAL ---
 @app.post("/uploadfile/")
 async def SubirVideo(background_tasks: BackgroundTasks, noise: bool = True, contrast: bool = True, file: UploadFile = File(...)):
+    
+    ############################### Validaciones ################################################################
     if file.content_type != 'video/mp4': raise HTTPException(status_code=400, detail="Error: formato inválido. Solo se aceptan archivos MP4.")
     uniqueName = f"{uuid.uuid4()}_{file.filename}"
     original_filePath = os.path.join(VIDEODIR, uniqueName)
     with open(original_filePath, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
     videoDetails = VideoFileClip(original_filePath)
+    
     if videoDetails.duration > 180:
         cleanup_files([original_filePath])
         videoDetails.close()
         raise HTTPException(status_code=400, detail="Duración máxima de 180 segundos excedida.")
+    
     videoDetails.close()
     processed_filePath = original_filePath
+    
+    ################################# Filtros ####################################################################
     if noise:
         eliminateNoise(processed_filePath, uniqueName)
         processed_filePath = os.path.join(PROCESSEDDIR, uniqueName)
+    
     if contrast:
         contraste(processed_filePath, noise, uniqueName)
         processed_filePath = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
+    
+
+    ############################# División del Video ###########################################################
     uncompressed_output_video = os.path.join(PROCESSEDDIR, f"rescaled_{uniqueName}")
+    
     if os.path.exists(AUXDIR_INPUT): shutil.rmtree(AUXDIR_INPUT)
     if os.path.exists(AUXDIR_OUTPUT): shutil.rmtree(AUXDIR_OUTPUT)
     os.makedirs(AUXDIR_INPUT, exist_ok=True)
     os.makedirs(AUXDIR_OUTPUT, exist_ok=True)
+    
     vidcap = cv2.VideoCapture(processed_filePath)
     fps = vidcap.get(cv2.CAP_PROP_FPS)
+    
     for i in range(int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))):
         success, image = vidcap.read()
         if not success: break
         cv2.imwrite(os.path.join(AUXDIR_INPUT, f'{i:04d}.png'), image)
     vidcap.release()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Usando dispositivo para PyTorch: {device}")
-    cudnn.benchmark = True
-    model = ESPCN(scale_factor=3).to(device)
-    model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device))
-    model.eval()
+
+
+######################################### Parte de Reescalado ###########################################
+
+
+# Preparar el modelo y comprobar CUDA
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"modelo cargado en {device}")
+    model = RealESRGAN(device, scale=2)
+    # carga los pesos (usa download=True solo si no los tienes)
+    model.load_weights('weights/RealESRGAN_x2.pth', download=True)
+
+    # Procesar frames usando model.predict (entrada: PIL.Image RGB)
     input_images = sorted(os.listdir(AUXDIR_INPUT))
-    for image_name in tqdm(input_images, desc="Reescalando frames (GPU)"):
-        if not image_name.lower().endswith('.png'): continue
-        img = Image.open(os.path.join(AUXDIR_INPUT, image_name)).convert('RGB')
-        y, cb, cr = img.convert('YCbCr').split()
-        inp = torch.from_numpy(np.array(y).astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
-        with torch.no_grad(): pred = model(inp).clamp(0.0, 1.0)
-        pred_np = pred.mul(255.0).cpu().numpy().squeeze().astype(np.uint8)
-        H, W = pred_np.shape
-        cb_up, cr_up = cb.resize((W, H), Image.BICUBIC), cr.resize((W, H), Image.BICUBIC)
-        rgb_out = convert_ycbcr_to_rgb(np.stack([pred_np, np.array(cb_up), np.array(cr_up)], axis=2))
-        out_img = Image.fromarray(np.clip(rgb_out, 0, 255).astype(np.uint8))
-        out_img.save(os.path.join(AUXDIR_OUTPUT, image_name))
-    first_image = cv2.imread(os.path.join(AUXDIR_OUTPUT, sorted(os.listdir(AUXDIR_OUTPUT))[0]))
-    height, width, _ = first_image.shape
-    out = cv2.VideoWriter(uncompressed_output_video, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-    for filename in sorted(os.listdir(AUXDIR_OUTPUT)):
-        if filename.lower().endswith('.png'): out.write(cv2.imread(os.path.join(AUXDIR_OUTPUT, filename)))
+    from tqdm import tqdm
+
+    for image_name in tqdm(input_images, desc="Procesando frames"):
+        if not image_name.lower().endswith('.png'):
+            continue
+
+        input_image_path = os.path.join(AUXDIR_INPUT, image_name)
+        output_image_path = os.path.join(AUXDIR_OUTPUT, image_name)
+
+        try:
+            # Abrir como PIL RGB
+            img = Image.open(input_image_path).convert('RGB')
+
+            # Opción A (recomendado): procesar todo el RGB con model.predict
+            sr_img = model.predict(img)
+
+            # Si usas GPU, sincronizar para asegurarte de que el trabajo termine antes de continuar
+            if device.type == 'cuda':
+                try:
+                    torch.cuda.synchronize(device)
+                except Exception:
+                    pass
+
+            # Guardar resultado (mismo nombre de archivo)
+            sr_img.save(output_image_path)
+
+        except Exception as e:
+            # Si falla un frame, lo anotamos y seguimos con el resto
+            print(f"ERROR procesando {input_image_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            # opcional: copiar el frame original al directorio de salida para no romper la secuencia
+            try:
+                Image.open(input_image_path).save(output_image_path)
+            except Exception:
+                pass
+
+    # Reconstruir el video
+    file_list = sorted(os.listdir(AUXDIR_OUTPUT))
+    first_image = None
+
+    # Determinar el tamaño a partir del primer frame válido
+    for filename in file_list:
+        if filename.endswith('.png'):
+            img = cv2.imread(os.path.join(AUXDIR_OUTPUT, filename))
+            if img is not None:
+                height, width, layers = img.shape
+                size = (width, height)
+                first_image = filename
+                break
+
+    if first_image is None:
+        print("[ERROR] No se encontró ningún frame válido.")
+        exit(1)
+
+    out = cv2.VideoWriter(uncompressed_output_video, cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
+
+    for filename in file_list:
+        if filename.endswith('.png'):
+            img = cv2.imread(os.path.join(AUXDIR_OUTPUT, filename))
+            if img is None:
+                print(f"[WARNING] Frame inválido: {filename}")
+                continue
+            out.write(img)
+
     out.release()
+
+
+################################### Parte de compresión ##################################################
     print(f"\n--- INICIANDO FASE 4: COMPRESIÓN FINAL CON FFMPEG ---")
     final_video_path = os.path.join(FINALDIR, f"compressed_{uniqueName}")
     comprimir_gpu(input_path=uncompressed_output_video, output_path=final_video_path)
