@@ -1,3 +1,4 @@
+# Contenido original
 fastapi
 uvicorn
 python-multipart
@@ -8,3 +9,15 @@ numpy
 Pillow
 tqdm
 python-dotenv
+
+# Librerías de IA añadidas
+RealESRGAN
+huggingface-hub==0.20.3
+
+
+# --- Bloque de PyTorch ---
+# Esta opción le dice a pip dónde buscar los siguientes paquetes
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch
+torchvision
+torchaudio
