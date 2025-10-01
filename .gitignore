@@ -1,2 +1,39 @@
-venv/
-venv/
+# -----------------------------
+# Entorno Virtual
+# -----------------------------
+# Ignorar la carpeta completa del entorno virtual
+/venv/
+
+# -----------------------------
+# Modelos de IA y Pesos
+# -----------------------------
+# Ignorar los pesos descargados
+/weights/
+
+# Ignorar la librería RealESRGAN si la tienes clonada en el proyecto
+/RealESRGAN/
+
+# -----------------------------
+# Archivos Generados por la API
+# -----------------------------
+# Ignorar videos subidos, procesados y resultados finales
+/Uploads/
+/Process/
+/FinalCompressed/
+/auxiliar/
+
+# -----------------------------
+# Archivos de Python y VS Code
+# -----------------------------
+# Ignorar la caché de Python
+__pycache__/
+*.pyc
+
+# Ignorar la configuración del espacio de trabajo de VS Code
+.vscode/
+
+# -----------------------------
+# Otros
+# -----------------------------
+# Archivos de sistema operativo como desktop.ini
+desktop.ini
