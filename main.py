@@ -135,12 +135,17 @@ def comprimir_video(input_path: str, output_path: str, audio_source: str | None 
 
 
 def cleanup_files(files_to_delete: list):
-    for f in files_to_delete:
-        try:
-            if os.path.exists(f):
-                os.remove(f)
-        except Exception:
-            pass
+    # Esta función ahora será llamada por el BackgroundTasks, 
+    # pero podemos modificar la lógica principal para no añadirle archivos.
+    # O simplemente no llamarla.
+    print("--- INICIANDO LIMPIEZA DE ARCHIVOS (DESACTIVADA PARA PRUEBAS) ---")
+    # for f in files_to_delete:
+    #     try:
+    #         if os.path.exists(f):
+    #             os.remove(f)
+    #             print(f"Limpiado (PRUEBA): {f}")
+    #     except Exception:
+    #         pass
 
 @app.post("/uploadfile/")
 async def SubirVideo(
@@ -160,7 +165,10 @@ async def SubirVideo(
 
     videoDetails = VideoFileClip(original_filePath)
     if videoDetails.duration > 180:
-        cleanup_files([original_filePath]); videoDetails.close()
+        # Aquí sí borramos el original si falla, para no acumular basura.
+        try: os.remove(original_filePath) 
+        except: pass
+        videoDetails.close()
         raise HTTPException(status_code=400, detail="Duración máxima de 180 segundos excedida.")
     videoDetails.close()
 
@@ -219,7 +227,7 @@ async def SubirVideo(
 
                 if len(frames) == batch_size:
                     batch_tensor = torch.stack(frames).to(device)  # BxCxHxW (RGB)
-                    output_batch = model.model(batch_tensor)        # salida en RGB normalizado
+                    output_batch = model.model(batch_tensor)      # salida en RGB normalizado
                     for i in range(output_batch.size(0)):
                         sr_img = output_batch[i].clamp(0,1).permute(1,2,0).cpu().numpy()
                         sr_img = (sr_img * 255.0).astype(np.uint8)   # RGB uint8
@@ -245,16 +253,26 @@ async def SubirVideo(
     audio_source = original_filePath
     comprimir_video(input_path=video_para_comprimir, output_path=final_video_path, audio_source=audio_source)
 
-    files_to_clean = [original_filePath]
-    p1 = os.path.join(PROCESSEDDIR, uniqueName)
-    p2 = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
-    if os.path.exists(p1): files_to_clean.append(p1)
-    if os.path.exists(p2): files_to_clean.append(p2)
-    if uncompressed_output_video and os.path.exists(uncompressed_output_video): files_to_clean.append(uncompressed_output_video)
-    for f in files_to_clean:
-        try: os.remove(f)
-        except Exception: pass
+    # --- BLOQUE DE LIMPIEZA DESACTIVADO PARA PRUEBAS ---
+    # print("\n--- LIMPIEZA DE ARCHIVOS DESACTIVADA ---")
+    # files_to_clean = [original_filePath]
+    # p1 = os.path.join(PROCESSEDDIR, uniqueName)
+    # p2 = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
+    # if os.path.exists(p1): files_to_clean.append(p1)
+    # if os.path.exists(p2): files_to_clean.append(p2)
+    # if uncompressed_output_video and os.path.exists(uncompressed_output_video): files_to_clean.append(uncompressed_output_video)
+    # 
+    # # En lugar de borrar, añadimos la tarea de limpieza (que ahora está vacía)
+    # # al fondo. O simplemente no hacemos nada.
+    # # background_tasks.add_task(cleanup_files, files_to_clean)
+    # print(f"Archivos intermedios conservados en {VIDEODIR} y {PROCESSEDDIR}")
+    
+    # --- FIN DEL BLOQUE DESACTIVADO ---
+
 
     if not os.path.exists(final_video_path) or os.path.getsize(final_video_path) == 0:
         raise HTTPException(status_code=500, detail="La compresión no produjo un archivo válido.")
+    
+    # Nota: El archivo final (final_video_path) sigue existiendo en FINALDIR
+    # y este FileResponse lo envía al usuario.
     return FileResponse(path=final_video_path, media_type='video/mp4', filename=f"compressed_{file.filename}")
