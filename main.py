@@ -1,4 +1,4 @@
-# main.py (Optimizado: reescalado IA en FP16 in-memory + compresión NVENC con audio original)
+# main.py (Optimizado: reescalado IA en FP16 + compresión NVENC con audio original + resoluciones estándar)
 import os, uuid, shutil, subprocess, time
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
@@ -81,8 +81,9 @@ def comprimir_video(input_path: str, output_path: str, audio_source: str | None 
     if audio_source and os.path.exists(audio_source):
         has_audio = _video_has_audio(audio_source)
 
-    common_flags = ['-y', '-loglevel', 'error']  # muestra solo errores
+    common_flags = ['-y', '-loglevel', 'error']
     if use_gpu:
+        print("✅ Compresión GPU: Usando NVENC con preset '{}' y CQ {}".format(PRESET_NVENC, CQ_VALUE))
         if has_audio:
             cmd = ['ffmpeg', *common_flags, '-hwaccel', 'cuda',
                    '-i', input_path, '-i', audio_source,
@@ -102,6 +103,7 @@ def comprimir_video(input_path: str, output_path: str, audio_source: str | None 
                    '-color_range', 'tv',
                    '-an', output_path]
     else:
+        print("🐢 Compresión CPU: Usando libx264 con preset '{}' y CRF {}".format(PRESET_CPU, CRF_VALUE))
         if has_audio:
             cmd = ['ffmpeg', *common_flags,
                    '-i', input_path, '-i', audio_source,
@@ -124,7 +126,7 @@ def comprimir_video(input_path: str, output_path: str, audio_source: str | None 
     start = time.time()
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     dur = time.time() - start
-    print(f"FFmpeg terminó en {dur:.2f}s, rc={proc.returncode}")
+    print(f"⏱️  Compresión completada en {dur:.2f}s (returncode={proc.returncode})")
     if proc.returncode != 0:
         msg = proc.stderr.decode('utf-8', errors='ignore') or 'FFmpeg falló sin mensaje'
         raise HTTPException(status_code=500, detail=f"FFmpeg error (rc={proc.returncode}): {msg}")
@@ -133,19 +135,13 @@ def comprimir_video(input_path: str, output_path: str, audio_source: str | None 
         msg = proc.stderr.decode('utf-8', errors='ignore')
         raise HTTPException(status_code=500, detail=f"Archivo de salida no generado o vacío: {output_path}. FFmpeg: {msg}")
 
-
 def cleanup_files(files_to_delete: list):
-    # Esta función ahora será llamada por el BackgroundTasks, 
-    # pero podemos modificar la lógica principal para no añadirle archivos.
-    # O simplemente no llamarla.
-    print("--- INICIANDO LIMPIEZA DE ARCHIVOS (DESACTIVADA PARA PRUEBAS) ---")
-    # for f in files_to_delete:
-    #     try:
-    #         if os.path.exists(f):
-    #             os.remove(f)
-    #             print(f"Limpiado (PRUEBA): {f}")
-    #     except Exception:
-    #         pass
+    for f in files_to_delete:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except Exception:
+            pass
 
 @app.post("/uploadfile/")
 async def SubirVideo(
@@ -165,10 +161,7 @@ async def SubirVideo(
 
     videoDetails = VideoFileClip(original_filePath)
     if videoDetails.duration > 180:
-        # Aquí sí borramos el original si falla, para no acumular basura.
-        try: os.remove(original_filePath) 
-        except: pass
-        videoDetails.close()
+        cleanup_files([original_filePath]); videoDetails.close()
         raise HTTPException(status_code=400, detail="Duración máxima de 180 segundos excedida.")
     videoDetails.close()
 
@@ -185,18 +178,23 @@ async def SubirVideo(
         processed_filePath = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
         video_para_comprimir = processed_filePath
 
+    # ------------------- Reescalado IA (GPU) -------------------
     uncompressed_output_video = ""
     if rescale:
         if not torch.cuda.is_available():
             raise HTTPException(status_code=400, detail="El reescalado con IA solo está disponible en modo GPU.")
 
-        print("\n--- INICIANDO FASE 3: REESCALADO CON IA (GPU, FP16, in-memory, batch) ---")
+        print("\n" + "="*70)
+        print("🚀 INICIANDO FASE 3: REESCALADO CON IA (GPU, FP16)")
+        print("="*70)
         device = torch.device('cuda')
         cudnn.benchmark = True
 
         model = RealESRGAN(device, scale=2)
         model.load_weights('weights/RealESRGAN_x2.pth', download=True)
-        model.model.eval(); model.model.to(device)
+        model.model.eval()
+        model.model.to(device)
+        print("✅ Modelo RealESRGAN cargado en GPU")
 
         cap = cv2.VideoCapture(processed_filePath)
         if not cap.isOpened():
@@ -205,74 +203,155 @@ async def SubirVideo(
         fps = cap.get(cv2.CAP_PROP_FPS)
         in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        out_w, out_h = in_w * 2, in_h * 2
-        uncompressed_output_video = os.path.join(PROCESSEDDIR, f"rescaled_{uniqueName}")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(uncompressed_output_video, fourcc, fps, (out_w, out_h))
-
-        batch_size = 8
-        frames = []
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.float16):
-            for _ in tqdm(range(total_frames), desc="Leyendo frames para batch"):
-                ok, frame_bgr = cap.read()
-                if not ok:
-                    break
-                # CORRECCIÓN DE COLOR: BGR -> RGB antes de crear el tensor
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                frame_tensor = torch.from_numpy(frame_rgb).permute(2,0,1).float().div(255.0)
-                frames.append(frame_tensor)
-
-                if len(frames) == batch_size:
-                    batch_tensor = torch.stack(frames).to(device)  # BxCxHxW (RGB)
-                    output_batch = model.model(batch_tensor)      # salida en RGB normalizado
+        
+        print(f"📊 Video original: {in_w}x{in_h} @ {fps:.2f} FPS")
+        
+        # --- DETERMINAR RESOLUCIÓN OBJETIVO ESTÁNDAR ---
+        standard_resolutions = {
+            480: 854,    # 480p
+            720: 1280,   # 720p HD
+            1080: 1920,  # 1080p Full HD
+            1440: 2560,  # 1440p 2K
+            2160: 3840   # 2160p 4K
+        }
+        
+        target_h = None
+        for std_h in sorted(standard_resolutions.keys()):
+            if std_h > in_h:
+                target_h = std_h
+                break
+        
+        if target_h is None:
+            print(f"⚠️  Video ya está en resolución alta ({in_w}x{in_h}). No se reescalará.")
+            video_para_comprimir = processed_filePath
+            cap.release()
+        else:
+            aspect_ratio = in_w / in_h
+            target_w = int(target_h * aspect_ratio)
+            target_w = target_w if target_w % 2 == 0 else target_w + 1
+            target_h = target_h if target_h % 2 == 0 else target_h + 1
+            
+            print(f"🎯 Resolución objetivo: {target_w}x{target_h}")
+            print(f"📐 Aspect ratio: {aspect_ratio:.3f}")
+            
+            frame_pixels = in_w * in_h
+            if frame_pixels <= 480 * 720:
+                batch_size = 5
+            elif frame_pixels <= 576 * 1024:
+                batch_size = 3
+            elif frame_pixels <= 720 * 1280:
+                batch_size = 2
+            else:
+                batch_size = 1
+            
+            print(f"🔢 Batch size dinámico calculado: {batch_size}")
+            print(f"🔄 Pipeline: OpenCV interpolación (CUBIC) → RealESRGAN IA → Ajuste final")
+            
+            uncompressed_output_video = os.path.join(PROCESSEDDIR, f"rescaled_{uniqueName}")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(uncompressed_output_video, fourcc, fps, (target_w, target_h))
+            
+            frames = []
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            processed_count = 0
+            
+            print(f"\n▶️  Procesando {total_frames} frames...")
+            
+            with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.float16):
+                for frame_idx in tqdm(range(total_frames), desc="🎬 Reescalando con IA"):
+                    ok, frame_bgr = cap.read()
+                    if not ok:
+                        break
+                    
+                    # PASO 1: Interpolación con OpenCV
+                    frame_resized = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+                    
+                    # PASO 2: Preparar para IA
+                    frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                    frame_tensor = torch.from_numpy(frame_rgb).permute(2,0,1).float().div(255.0)
+                    frames.append(frame_tensor)
+                    
+                    if len(frames) == batch_size:
+                        try:
+                            batch_tensor = torch.stack(frames).to(device)
+                            output_batch = model.model(batch_tensor)
+                            
+                            for i in range(output_batch.size(0)):
+                                sr_img = output_batch[i].clamp(0,1).permute(1,2,0).cpu().numpy()
+                                sr_img = (sr_img * 255.0).astype(np.uint8)
+                                sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
+                                
+                                if sr_img_bgr.shape[1] != target_w or sr_img_bgr.shape[0] != target_h:
+                                    sr_img_bgr = cv2.resize(sr_img_bgr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                                
+                                out.write(sr_img_bgr)
+                                processed_count += 1
+                            
+                            del batch_tensor, output_batch
+                            torch.cuda.empty_cache()
+                        
+                        except torch.cuda.OutOfMemoryError:
+                            print(f"\n⚠️  VRAM insuficiente con batch={batch_size}. Cambiando a modo frame-por-frame...")
+                            for frame_tensor in frames:
+                                single_batch = frame_tensor.unsqueeze(0).to(device)
+                                output = model.model(single_batch)
+                                sr_img = output[0].clamp(0,1).permute(1,2,0).cpu().numpy()
+                                sr_img = (sr_img * 255.0).astype(np.uint8)
+                                sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
+                                
+                                if sr_img_bgr.shape[1] != target_w or sr_img_bgr.shape[0] != target_h:
+                                    sr_img_bgr = cv2.resize(sr_img_bgr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                                
+                                out.write(sr_img_bgr)
+                                processed_count += 1
+                                del single_batch, output
+                                torch.cuda.empty_cache()
+                        
+                        frames = []
+                
+                if len(frames) > 0:
+                    print(f"\n🔄 Procesando últimos {len(frames)} frames...")
+                    batch_tensor = torch.stack(frames).to(device)
+                    output_batch = model.model(batch_tensor)
                     for i in range(output_batch.size(0)):
                         sr_img = output_batch[i].clamp(0,1).permute(1,2,0).cpu().numpy()
-                        sr_img = (sr_img * 255.0).astype(np.uint8)   # RGB uint8
-                        # Volver a BGR para VideoWriter de OpenCV
+                        sr_img = (sr_img * 255.0).astype(np.uint8)
                         sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
+                        
+                        if sr_img_bgr.shape[1] != target_w or sr_img_bgr.shape[0] != target_h:
+                            sr_img_bgr = cv2.resize(sr_img_bgr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                        
                         out.write(sr_img_bgr)
-                    frames = []
+                        processed_count += 1
+            
+            cap.release()
+            out.release()
+            video_para_comprimir = uncompressed_output_video
+            
+            print(f"\n✅ Reescalado completado: {processed_count}/{total_frames} frames procesados")
+            print("="*70 + "\n")
 
-            if len(frames) > 0:
-                batch_tensor = torch.stack(frames).to(device)
-                output_batch = model.model(batch_tensor)
-                for i in range(output_batch.size(0)):
-                    sr_img = output_batch[i].clamp(0,1).permute(1,2,0).cpu().numpy()
-                    sr_img = (sr_img * 255.0).astype(np.uint8)
-                    sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
-                    out.write(sr_img_bgr)
-
-        cap.release(); out.release()
-        video_para_comprimir = uncompressed_output_video
-
-    print("\n--- INICIANDO FASE 4: COMPRESIÓN FINAL CON FFMPEG ---")
+    print("\n" + "="*70)
+    print("🎞️  INICIANDO FASE 4: COMPRESIÓN FINAL CON FFMPEG")
+    print("="*70)
     final_video_path = os.path.join(FINALDIR, f"compressed_{uniqueName}")
     audio_source = original_filePath
     comprimir_video(input_path=video_para_comprimir, output_path=final_video_path, audio_source=audio_source)
 
-    # --- BLOQUE DE LIMPIEZA DESACTIVADO PARA PRUEBAS ---
-    # print("\n--- LIMPIEZA DE ARCHIVOS DESACTIVADA ---")
+    print("\n" + "="*70)
+    print("✅ PROCESAMIENTO COMPLETADO EXITOSAMENTE")
+    print("="*70 + "\n")
+
     # files_to_clean = [original_filePath]
     # p1 = os.path.join(PROCESSEDDIR, uniqueName)
     # p2 = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
     # if os.path.exists(p1): files_to_clean.append(p1)
     # if os.path.exists(p2): files_to_clean.append(p2)
     # if uncompressed_output_video and os.path.exists(uncompressed_output_video): files_to_clean.append(uncompressed_output_video)
-    # 
-    # # En lugar de borrar, añadimos la tarea de limpieza (que ahora está vacía)
-    # # al fondo. O simplemente no hacemos nada.
-    # # background_tasks.add_task(cleanup_files, files_to_clean)
-    # print(f"Archivos intermedios conservados en {VIDEODIR} y {PROCESSEDDIR}")
-    
-    # --- FIN DEL BLOQUE DESACTIVADO ---
-
+    # for f in files_to_clean:
+    #     try: os.remove(f)
+    #     except Exception: pass
 
     if not os.path.exists(final_video_path) or os.path.getsize(final_video_path) == 0:
         raise HTTPException(status_code=500, detail="La compresión no produjo un archivo válido.")
-    
-    # Nota: El archivo final (final_video_path) sigue existiendo en FINALDIR
-    # y este FileResponse lo envía al usuario.
     return FileResponse(path=final_video_path, media_type='video/mp4', filename=f"compressed_{file.filename}")
