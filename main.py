@@ -2,7 +2,7 @@
 import os, uuid, shutil, subprocess, time
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
-from moviepy.editor import VideoFileClip
+from moviepy import VideoFileClip
 import cv2, numpy as np
 from tqdm import tqdm
 import torch, torch.backends.cudnn as cudnn
@@ -197,6 +197,9 @@ async def SubirVideo(
         raise HTTPException(status_code=400, detail="Duración máxima de 180 segundos excedida.")
     videoDetails.close()
 
+    temp_audio = os.path.join(PROCESSEDDIR, f"audio_{uniqueName}.aac")
+    subprocess.run(['ffmpeg', '-y', '-i', original_filePath, '-vn', '-acodec', 'aac', temp_audio], check=True)
+    audio_source = temp_audio
 
 
 
@@ -319,7 +322,6 @@ async def SubirVideo(
 
     print("\n--- INICIANDO FASE 4: COMPRESIÓN FINAL CON FFMPEG ---")
     final_video_path = os.path.join(FINALDIR, f"compressed_{uniqueName}")
-    audio_source = original_filePath
     comprimir_video(input_path=video_para_comprimir, output_path=final_video_path, audio_source=audio_source)
 
     # --- BLOQUE DE LIMPIEZA DESACTIVADO PARA PRUEBAS ---
