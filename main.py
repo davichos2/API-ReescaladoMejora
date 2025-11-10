@@ -9,6 +9,19 @@ import torch, torch.backends.cudnn as cudnn
 from PIL import Image
 from RealESRGAN import RealESRGAN
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # 🔹 Permite cualquier origen
+    allow_credentials=True,
+    allow_methods=["*"],        # Permite todos los métodos (GET, POST, etc.)
+    allow_headers=["*"],        # Permite todos los headers
+)
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEODIR = os.path.join(BASE_DIR, "Uploads/")
@@ -20,9 +33,6 @@ CQ_VALUE = '31'
 PRESET_CPU = 'veryfast'
 CRF_VALUE = '28'
 processing_status = {}
-
-
-app = FastAPI()
 
 @app.on_event("startup")
 async def startup_event():
