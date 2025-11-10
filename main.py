@@ -8,6 +8,20 @@ from tqdm import tqdm
 import torch, torch.backends.cudnn as cudnn
 from PIL import Image
 from RealESRGAN import RealESRGAN
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # 🔹 Permite cualquier origen
+    allow_credentials=True,
+    allow_methods=["*"],        # Permite todos los métodos (GET, POST, etc.)
+    allow_headers=["*"],        # Permite todos los headers
+)
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEODIR = os.path.join(BASE_DIR, "Uploads/")
@@ -18,8 +32,7 @@ PRESET_NVENC = 'medium'
 CQ_VALUE = '31'
 PRESET_CPU = 'veryfast'
 CRF_VALUE = '28'
-
-app = FastAPI()
+processing_status = {}
 
 @app.on_event("startup")
 async def startup_event():
@@ -165,6 +178,190 @@ def cleanup_files(files_to_delete: list):
     #     except Exception:
     #         pass
 
+def procesar_video_en_segundo_plano(
+    uniqueName,
+    original_filePath,
+    audio_source,
+    noise,
+    noise_d,
+    noise_sigmaColor,
+    noise_sigmaSpace,
+    contrast,
+    contrast_clipLimit,
+    contrast_tileGridSize,
+    rescale
+):
+    try:
+        processing_status[uniqueName] = {"status": "processing"}
+
+        tileGrid = tuple(map(int, contrast_tileGridSize.split(",")))
+        
+        videoDetails = VideoFileClip(original_filePath)
+        if videoDetails.duration > 181:
+            try: os.remove(original_filePath)
+            except: pass
+            videoDetails.close()
+            raise HTTPException(status_code=400, detail="Duración máxima de 180 segundos excedida.")
+        videoDetails.close()
+
+        temp_audio = os.path.join(PROCESSEDDIR, f"audio_{uniqueName}.aac")
+        subprocess.run(['ffmpeg', '-y', '-i', original_filePath, '-vn', '-acodec', 'aac', temp_audio], check=True)
+        audio_source = temp_audio
+
+    
+        processed_filePath = original_filePath
+        video_para_comprimir = original_filePath
+
+        cap = cv2.VideoCapture(processed_filePath)
+        if not cap.isOpened():
+            raise HTTPException(status_code=500, detail="No se pudo abrir el video para reescalar.")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        standard_resolutions = [360,480, 720, 1080, 1440, 2160]
+
+        # Buscar siguiente resolución mayor en la lista
+        target_h = next((h for h in standard_resolutions if h > in_h), None)
+        if target_h is None:
+            target_h = in_h  # ya está en la más alta
+
+
+        scale = 2
+        input_h_for_model = target_h // scale
+        input_w_for_model = int(input_h_for_model * (in_w / in_h))
+        input_w_for_model += input_w_for_model % 2  # asegurar par
+        input_h_for_model += input_h_for_model % 2  # asegurar par
+        
+        # Nombre temporal para el resize
+        resized_file = os.path.join(PROCESSEDDIR, f"resized_{uniqueName}")
+
+        # Hacer resize
+        resize_video_ffmpeg(processed_filePath, resized_file, input_w_for_model, input_h_for_model)
+
+        # Sobrescribir processed_filePath para que el resto del pipeline use el video redimensionado
+        processed_filePath = resized_file
+        video_para_comprimir = processed_filePath
+
+        # (Opcional) Borrar archivo original si no lo necesitas más
+        try:
+            cap.release()
+            os.remove(original_filePath)
+        except FileNotFoundError:
+            pass
+        cap = cv2.VideoCapture(processed_filePath)
+
+
+        if noise:
+            eliminateNoise(processed_filePath, uniqueName, d=noise_d, sigmaColor=noise_sigmaColor, sigmaSpace=noise_sigmaSpace)
+            processed_filePath = os.path.join(PROCESSEDDIR, uniqueName)
+            video_para_comprimir = processed_filePath
+
+        if contrast:
+            contraste(processed_filePath, noise, uniqueName, clipLimit=contrast_clipLimit, tileGridSize=tileGrid)
+            processed_filePath = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
+            video_para_comprimir = processed_filePath
+
+        uncompressed_output_video = ""
+        if rescale:
+            if not torch.cuda.is_available():
+                raise HTTPException(status_code=400, detail="El reescalado con IA solo está disponible en modo GPU.")
+
+            print("\n--- INICIANDO FASE 3: REESCALADO CON IA (GPU, FP16, in-memory, batch) ---")
+            device = torch.device('cuda')
+            cudnn.benchmark = True
+
+            model = RealESRGAN(device, scale=2)
+            model.load_weights('weights/RealESRGAN_x2.pth', download=True)
+            model.model.eval(); model.model.to(device)
+
+            cap = cv2.VideoCapture(processed_filePath)
+            if not cap.isOpened():
+                raise HTTPException(status_code=500, detail="No se pudo abrir el video para reescalar.")
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            out_w, out_h = in_w * 2, in_h * 2
+            uncompressed_output_video = os.path.join(PROCESSEDDIR, f"rescaled_{uniqueName}")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(uncompressed_output_video, fourcc, fps, (out_w, out_h))
+
+            batch_size = 2
+            frames = []
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.float16):
+                for _ in tqdm(range(total_frames), desc="Leyendo frames para batch"):
+                    ok, frame_bgr = cap.read()
+                    if not ok:
+                        break
+                    # CORRECCIÓN DE COLOR: BGR -> RGB antes de crear el tensor
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    frame_tensor = torch.from_numpy(frame_rgb).permute(2,0,1).float().div(255.0)
+                    frames.append(frame_tensor)
+
+                    if len(frames) == batch_size:
+                        batch_tensor = torch.stack(frames).to(device)  # BxCxHxW (RGB)
+                        output_batch = model.model(batch_tensor)      # salida en RGB normalizado
+                        for i in range(output_batch.size(0)):
+                            sr_img = output_batch[i].clamp(0,1).permute(1,2,0).cpu().numpy()
+                            sr_img = (sr_img * 255.0).astype(np.uint8)   # RGB uint8
+                            # Volver a BGR para VideoWriter de OpenCV
+                            sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
+                            out.write(sr_img_bgr)
+                        frames = []
+
+                if len(frames) > 0:
+                    batch_tensor = torch.stack(frames).to(device)
+                    output_batch = model.model(batch_tensor)
+                    for i in range(output_batch.size(0)):
+                        sr_img = output_batch[i].clamp(0,1).permute(1,2,0).cpu().numpy()
+                        sr_img = (sr_img * 255.0).astype(np.uint8)
+                        sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
+                        out.write(sr_img_bgr)
+
+            cap.release(); out.release()
+            video_para_comprimir = uncompressed_output_video
+
+        print("\n--- INICIANDO FASE 4: COMPRESIÓN FINAL CON FFMPEG ---")
+        final_video_path = os.path.join(FINALDIR, f"compressed_{uniqueName}")
+        comprimir_video(input_path=video_para_comprimir, output_path=final_video_path, audio_source=audio_source)
+
+        # --- BLOQUE DE LIMPIEZA DESACTIVADO PARA PRUEBAS ---
+        # print("\n--- LIMPIEZA DE ARCHIVOS DESACTIVADA ---")
+        # files_to_clean = [original_filePath]
+        # p1 = os.path.join(PROCESSEDDIR, uniqueName)
+        # p2 = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
+        # if os.path.exists(p1): files_to_clean.append(p1)
+        # if os.path.exists(p2): files_to_clean.append(p2)
+        # if uncompressed_output_video and os.path.exists(uncompressed_output_video): files_to_clean.append(uncompressed_output_video)
+        # 
+        # # En lugar de borrar, añadimos la tarea de limpieza (que ahora está vacía)
+        # # al fondo. O simplemente no hacemos nada.
+        # # background_tasks.add_task(cleanup_files, files_to_clean)
+        # print(f"Archivos intermedios conservados en {VIDEODIR} y {PROCESSEDDIR}")
+        
+        # --- FIN DEL BLOQUE DESACTIVADO ---
+        
+        if not os.path.exists(final_video_path) or os.path.getsize(final_video_path) == 0:
+            raise HTTPException(status_code=500, detail="La compresión no produjo un archivo válido.")
+        
+        processing_status[uniqueName] = {
+            "status": "completed",
+            "output_path": final_video_path
+        }
+    except Exception as e:
+        processing_status[uniqueName] = {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+
+
 @app.post("/uploadfile/")
 async def SubirVideo(
     background_tasks: BackgroundTasks,
@@ -178,172 +375,85 @@ async def SubirVideo(
     rescale: bool = True,
     file: UploadFile = File(...)
 ):
-    
     tileGrid = tuple(map(int, contrast_tileGridSize.split(",")))
+
     if file.content_type != 'video/mp4':
         raise HTTPException(status_code=400, detail="Error: formato inválido. Solo se aceptan archivos MP4.")
 
+    # Guardar el archivo original
     uniqueName = f"{uuid.uuid4()}_{file.filename}"
     original_filePath = os.path.join(VIDEODIR, uniqueName)
     with open(original_filePath, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    # Registrar el estado inicial del procesamiento
+    processing_status[uniqueName] = {"status": "processing"}
+
+    # Validar duración del video
     videoDetails = VideoFileClip(original_filePath)
-    if videoDetails.duration > 180:
-        # Aquí sí borramos el original si falla, para no acumular basura.
-        try: os.remove(original_filePath) 
+    if videoDetails.duration > 181:
+        try: os.remove(original_filePath)
         except: pass
         videoDetails.close()
         raise HTTPException(status_code=400, detail="Duración máxima de 180 segundos excedida.")
     videoDetails.close()
 
+    # Extraer el audio
     temp_audio = os.path.join(PROCESSEDDIR, f"audio_{uniqueName}.aac")
     subprocess.run(['ffmpeg', '-y', '-i', original_filePath, '-vn', '-acodec', 'aac', temp_audio], check=True)
-    audio_source = temp_audio
+
+    # Agregar la tarea en segundo plano
+    background_tasks.add_task(
+        procesar_video_en_segundo_plano,
+        uniqueName,
+        original_filePath,
+        temp_audio,
+        noise,
+        noise_d,
+        noise_sigmaColor,
+        noise_sigmaSpace,
+        contrast,
+        contrast_clipLimit,
+        contrast_tileGridSize,
+        rescale
+    )
+
+    return {
+        "status": "processing",
+        "message": f"El video '{file.filename}' se está procesando en segundo plano.",
+        "id": uniqueName
+    }
 
 
 
-    processed_filePath = original_filePath
-    video_para_comprimir = original_filePath
+@app.get("/result/{video_id}")
+async def ObtenerResultado(video_id: str):
+    # Buscar si existe el id
+    status_info = processing_status.get(video_id)
 
-    cap = cv2.VideoCapture(processed_filePath)
-    if not cap.isOpened():
-        raise HTTPException(status_code=500, detail="No se pudo abrir el video para reescalar.")
+    # Caso: no existe el ID
+    if not status_info:
+        return JSONResponse({"status": "not_found"}, status_code=404)
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Caso: sigue procesando
+    if status_info["status"] == "processing":
+        return {"status": "processing"}
 
-    standard_resolutions = [360,480, 720, 1080, 1440, 2160]
+    # Caso: terminó correctamente
+    elif status_info["status"] == "completed":
+        output_path = status_info.get("output_path")
+        if output_path and os.path.exists(output_path):
+            return FileResponse(
+                output_path,
+                media_type="video/mp4",
+                filename=f"{video_id}.mp4"
+            )
+        else:
+            return JSONResponse(
+                {"status": "error", "error": "Archivo no encontrado"},
+                status_code=500
+            )
 
-    # Buscar siguiente resolución mayor en la lista
-    target_h = next((h for h in standard_resolutions if h > in_h), None)
-    if target_h is None:
-        target_h = in_h  # ya está en la más alta
-
-
-    scale = 2
-    input_h_for_model = target_h // scale
-    input_w_for_model = int(input_h_for_model * (in_w / in_h))
-    input_w_for_model += input_w_for_model % 2  # asegurar par
-    input_h_for_model += input_h_for_model % 2  # asegurar par
-    
-    # Nombre temporal para el resize
-    resized_file = os.path.join(PROCESSEDDIR, f"resized_{uniqueName}")
-
-    # Hacer resize
-    resize_video_ffmpeg(processed_filePath, resized_file, input_w_for_model, input_h_for_model)
-
-    # Sobrescribir processed_filePath para que el resto del pipeline use el video redimensionado
-    processed_filePath = resized_file
-    video_para_comprimir = processed_filePath
-
-    # (Opcional) Borrar archivo original si no lo necesitas más
-    try:
-        cap.release()
-        os.remove(original_filePath)
-    except FileNotFoundError:
-        pass
-    cap = cv2.VideoCapture(processed_filePath)
-
-
-    if noise:
-        eliminateNoise(processed_filePath, uniqueName, d=noise_d, sigmaColor=noise_sigmaColor, sigmaSpace=noise_sigmaSpace)
-        processed_filePath = os.path.join(PROCESSEDDIR, uniqueName)
-        video_para_comprimir = processed_filePath
-
-    if contrast:
-        contraste(processed_filePath, noise, uniqueName, clipLimit=contrast_clipLimit, tileGridSize=tileGrid)
-        processed_filePath = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
-        video_para_comprimir = processed_filePath
-
-    uncompressed_output_video = ""
-    if rescale:
-        if not torch.cuda.is_available():
-            raise HTTPException(status_code=400, detail="El reescalado con IA solo está disponible en modo GPU.")
-
-        print("\n--- INICIANDO FASE 3: REESCALADO CON IA (GPU, FP16, in-memory, batch) ---")
-        device = torch.device('cuda')
-        cudnn.benchmark = True
-
-        model = RealESRGAN(device, scale=2)
-        model.load_weights('weights/RealESRGAN_x2.pth', download=True)
-        model.model.eval(); model.model.to(device)
-
-        cap = cv2.VideoCapture(processed_filePath)
-        if not cap.isOpened():
-            raise HTTPException(status_code=500, detail="No se pudo abrir el video para reescalar.")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        out_w, out_h = in_w * 2, in_h * 2
-        uncompressed_output_video = os.path.join(PROCESSEDDIR, f"rescaled_{uniqueName}")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(uncompressed_output_video, fourcc, fps, (out_w, out_h))
-
-        batch_size = 2
-        frames = []
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.float16):
-            for _ in tqdm(range(total_frames), desc="Leyendo frames para batch"):
-                ok, frame_bgr = cap.read()
-                if not ok:
-                    break
-                # CORRECCIÓN DE COLOR: BGR -> RGB antes de crear el tensor
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                frame_tensor = torch.from_numpy(frame_rgb).permute(2,0,1).float().div(255.0)
-                frames.append(frame_tensor)
-
-                if len(frames) == batch_size:
-                    batch_tensor = torch.stack(frames).to(device)  # BxCxHxW (RGB)
-                    output_batch = model.model(batch_tensor)      # salida en RGB normalizado
-                    for i in range(output_batch.size(0)):
-                        sr_img = output_batch[i].clamp(0,1).permute(1,2,0).cpu().numpy()
-                        sr_img = (sr_img * 255.0).astype(np.uint8)   # RGB uint8
-                        # Volver a BGR para VideoWriter de OpenCV
-                        sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
-                        out.write(sr_img_bgr)
-                    frames = []
-
-            if len(frames) > 0:
-                batch_tensor = torch.stack(frames).to(device)
-                output_batch = model.model(batch_tensor)
-                for i in range(output_batch.size(0)):
-                    sr_img = output_batch[i].clamp(0,1).permute(1,2,0).cpu().numpy()
-                    sr_img = (sr_img * 255.0).astype(np.uint8)
-                    sr_img_bgr = cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR)
-                    out.write(sr_img_bgr)
-
-        cap.release(); out.release()
-        video_para_comprimir = uncompressed_output_video
-
-    print("\n--- INICIANDO FASE 4: COMPRESIÓN FINAL CON FFMPEG ---")
-    final_video_path = os.path.join(FINALDIR, f"compressed_{uniqueName}")
-    comprimir_video(input_path=video_para_comprimir, output_path=final_video_path, audio_source=audio_source)
-
-    # --- BLOQUE DE LIMPIEZA DESACTIVADO PARA PRUEBAS ---
-    # print("\n--- LIMPIEZA DE ARCHIVOS DESACTIVADA ---")
-    # files_to_clean = [original_filePath]
-    # p1 = os.path.join(PROCESSEDDIR, uniqueName)
-    # p2 = os.path.join(PROCESSEDDIR, f"pre_{uniqueName}")
-    # if os.path.exists(p1): files_to_clean.append(p1)
-    # if os.path.exists(p2): files_to_clean.append(p2)
-    # if uncompressed_output_video and os.path.exists(uncompressed_output_video): files_to_clean.append(uncompressed_output_video)
-    # 
-    # # En lugar de borrar, añadimos la tarea de limpieza (que ahora está vacía)
-    # # al fondo. O simplemente no hacemos nada.
-    # # background_tasks.add_task(cleanup_files, files_to_clean)
-    # print(f"Archivos intermedios conservados en {VIDEODIR} y {PROCESSEDDIR}")
-    
-    # --- FIN DEL BLOQUE DESACTIVADO ---
-
-
-    if not os.path.exists(final_video_path) or os.path.getsize(final_video_path) == 0:
-        raise HTTPException(status_code=500, detail="La compresión no produjo un archivo válido.")
-    
-    # Nota: El archivo final (final_video_path) sigue existiendo en FINALDIR
-    # y este FileResponse lo envía al usuario.
-    return FileResponse(path=final_video_path, media_type='video/mp4', filename=f"compressed_{file.filename}")
+    # Caso: error durante el procesamiento
+    elif status_info["status"] == "error":
+        return {"status": "error", "details": status_info["error"]}
