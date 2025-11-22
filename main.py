@@ -1,6 +1,6 @@
 # main.py (Optimizado: reescalado IA en FP16 in-memory + compresión NVENC con audio original)
 import os, uuid, shutil, subprocess, time
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import FileResponse
 from moviepy import VideoFileClip
 import cv2, numpy as np
@@ -16,7 +16,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # 🔹 Permite cualquier origen
+    allow_origins=["*"],        
     allow_credentials=True,
     allow_methods=["*"],        # Permite todos los métodos (GET, POST, etc.)
     allow_headers=["*"],        # Permite todos los headers
@@ -191,6 +191,10 @@ def procesar_video_en_segundo_plano(
     contrast_tileGridSize,
     rescale
 ):
+    print(f" DEBUG - Parámetros recibidos:")
+    print(f"  noise={noise} (tipo: {type(noise)})")
+    print(f"  contrast={contrast} (tipo: {type(contrast)})")
+    print(f"  rescale={rescale} (tipo: {type(rescale)})")
     try:
         processing_status[uniqueName] = {"status": "processing"}
 
@@ -361,20 +365,28 @@ def procesar_video_en_segundo_plano(
 
 
 
-
 @app.post("/uploadfile/")
 async def SubirVideo(
     background_tasks: BackgroundTasks,
-    noise: bool = True,
-    noise_d: int = 9,
-    noise_sigmaColor: int = 75,
-    noise_sigmaSpace: int = 75,
-    contrast: bool = True,
-    contrast_clipLimit: float = 2.0,
-    contrast_tileGridSize: str = "8,8",
-    rescale: bool = True,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    noise: str = Form("true"),
+    noise_d: str = Form("9"),  # 🔹 Recibir todo como string
+    noise_sigmaColor: str = Form("75"),
+    noise_sigmaSpace: str = Form("75"),
+    contrast: str = Form("true"),
+    contrast_clipLimit: str = Form("2.0"),
+    contrast_tileGridSize: str = Form("8,8"),
+    rescale: str = Form("true")
 ):
+    # 🔹 Convertir manualmente todos los tipos
+    noise_bool = noise.lower() in ["true", "1", "yes"]
+    contrast_bool = contrast.lower() in ["true", "1", "yes"]
+    rescale_bool = rescale.lower() in ["true", "1", "yes"]
+    
+    noise_d_int = int(noise_d)
+    noise_sigmaColor_int = int(noise_sigmaColor)
+    noise_sigmaSpace_int = int(noise_sigmaSpace)
+    contrast_clipLimit_float = float(contrast_clipLimit)
     tileGrid = tuple(map(int, contrast_tileGridSize.split(",")))
 
     if file.content_type != 'video/mp4':
@@ -402,20 +414,20 @@ async def SubirVideo(
     temp_audio = os.path.join(PROCESSEDDIR, f"audio_{uniqueName}.aac")
     subprocess.run(['ffmpeg', '-y', '-i', original_filePath, '-vn', '-acodec', 'aac', temp_audio], check=True)
 
-    # Agregar la tarea en segundo plano
+    # Agregar la tarea en segundo plano con los booleanos convertidos
     background_tasks.add_task(
         procesar_video_en_segundo_plano,
         uniqueName,
         original_filePath,
         temp_audio,
-        noise,
+        noise_bool,  
         noise_d,
         noise_sigmaColor,
         noise_sigmaSpace,
-        contrast,
+        contrast_bool,  
         contrast_clipLimit,
         contrast_tileGridSize,
-        rescale
+        rescale_bool  
     )
 
     return {
