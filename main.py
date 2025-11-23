@@ -244,7 +244,8 @@ def procesar_video_en_segundo_plano(
     contrast,
     contrast_clipLimit,
     contrast_tileGridSize,
-    rescale
+    rescale,
+    videoReescaled
 ):
     print(f"🔍 DEBUG - Parámetros recibidos:")
     print(f"  noise={noise} (tipo: {type(noise)})")
@@ -270,43 +271,58 @@ def procesar_video_en_segundo_plano(
     
         processed_filePath = original_filePath
         video_para_comprimir = original_filePath
+        if videoReescaled:
+            cap = cv2.VideoCapture(processed_filePath)
+            if not cap.isOpened():
+                raise HTTPException(status_code=500, detail="No se pudo abrir el video para reescalar.")
 
-        cap = cv2.VideoCapture(processed_filePath)
-        if not cap.isOpened():
-            raise HTTPException(status_code=500, detail="No se pudo abrir el video para reescalar.")
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            standard_resolutions = [360,480, 720, 1080, 1440, 2160]
 
-        standard_resolutions = [360,480, 720, 1080, 1440, 2160]
-
-        # Buscar siguiente resolución mayor en la lista
-        target_h = next((h for h in standard_resolutions if h > in_h), None)
-        if target_h is None:
-            target_h = in_h  # ya está en la más alta
+            # Buscar siguiente resolución mayor en la lista
+            target_h = next((h for h in standard_resolutions if h > in_h), None)
+            if target_h is None:
+                target_h = in_h  # ya está en la más alta
 
 
-        scale = 2
-        input_h_for_model = target_h // scale
-        input_w_for_model = int(input_h_for_model * (in_w / in_h))
-        input_w_for_model += input_w_for_model % 2  # asegurar par
-        input_h_for_model += input_h_for_model % 2  # asegurar par
-        
-        # Nombre temporal para el resize
-        resized_file = os.path.join(PROCESSEDDIR, f"resized_{uniqueName}")
+            scale = 2
+            input_h_for_model = target_h // scale
+            input_w_for_model = int(input_h_for_model * (in_w / in_h))
+            input_w_for_model += input_w_for_model % 2  # asegurar par
+            input_h_for_model += input_h_for_model % 2  # asegurar par
+            
+            # Nombre temporal para el resize
+            resized_file = os.path.join(PROCESSEDDIR, f"resized_{uniqueName}")
 
-        # Hacer resize
-        resize_video_ffmpeg(processed_filePath, resized_file, input_w_for_model, input_h_for_model)
+            # Hacer resize
+            resize_video_ffmpeg(processed_filePath, resized_file, input_w_for_model, input_h_for_model)
 
-        # Sobrescribir processed_filePath para que el resto del pipeline use el video redimensionado
-        processed_filePath = resized_file
+            # Sobrescribir processed_filePath para que el resto del pipeline use el video redimensionado
+            processed_filePath = resized_file
+        else:
+            # Verificamos si el video original es demasiado grande (>= 2K)
+            cap = cv2.VideoCapture(processed_filePath)
+            if cap.isOpened():
+                h_check = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                w_check = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                cap.release() 
+
+                # 1440p es la altura de 2K (2560x1440)
+                if h_check >= 1440:
+                    error_msg = f"Escala excedida: El video original es 2K ({w_check}x{h_check}). Activa 'Reescalado Estándar' para procesarlo."
+                    print(f"{error_msg}")
+                    # Esto saltará al 'except' general de tu función y guardará el error en processing_status
+                    raise Exception(error_msg)
         video_para_comprimir = processed_filePath
 
         # (Opcional) Borrar archivo original si no lo necesitas más
         try:
-            cap.release()
-            os.remove(original_filePath)
+            #cap.release()
+            if original_filePath != processed_filePath:
+                os.remove(original_filePath)
         except FileNotFoundError:
             pass
         cap = cv2.VideoCapture(processed_filePath)
@@ -431,12 +447,14 @@ async def SubirVideo(
     contrast: str = Form("true"),
     contrast_clipLimit: str = Form("2.0"),
     contrast_tileGridSize: str = Form("8,8"),
-    rescale: str = Form("true")
+    rescale: str = Form("true"),
+    videoReescaled: str = Form("true")
 ):
     # 🔹 Convertir manualmente todos los tipos
     noise_bool = noise.lower() in ["true", "1", "yes"]
     contrast_bool = contrast.lower() in ["true", "1", "yes"]
     rescale_bool = rescale.lower() in ["true", "1", "yes"]
+    resize_std_bool = videoReescaled.lower() in ["true", "1", "yes", "on"]
     
     noise_d_int = int(noise_d)
     noise_sigmaColor_int = int(noise_sigmaColor)
@@ -482,7 +500,8 @@ async def SubirVideo(
         contrast_bool,  # 🔹 Usar el booleano convertido
         contrast_clipLimit,
         contrast_tileGridSize,
-        rescale_bool  # 🔹 Usar el booleano convertido
+        rescale_bool,  # 🔹 Usar el booleano convertido
+        resize_std_bool
     )
 
     return {
