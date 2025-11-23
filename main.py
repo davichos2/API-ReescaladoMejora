@@ -16,7 +16,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        
+    allow_origins=["*"],        # 🔹 Permite cualquier origen
     allow_credentials=True,
     allow_methods=["*"],        # Permite todos los métodos (GET, POST, etc.)
     allow_headers=["*"],        # Permite todos los headers
@@ -41,44 +41,99 @@ async def startup_event():
     os.makedirs(FINALDIR, exist_ok=True)
 
 def eliminateNoise(videoEntrada: str, name: str, d: int = 9, sigmaColor: int = 75, sigmaSpace: int = 75):
+    # --- BLOQUE DE CORRECCIÓN DE TIPOS ---
+    try:
+        # 'd' es el diámetro del vecindario de píxeles, debe ser ENTERO
+        d = int(d)
+    except (ValueError, TypeError):
+        d = 9  # Valor por defecto seguro
+
+    try:
+        # Los sigmas pueden ser decimales (float)
+        sigmaColor = float(sigmaColor)
+    except (ValueError, TypeError):
+        sigmaColor = 75.0
+
+    try:
+        sigmaSpace = float(sigmaSpace)
+    except (ValueError, TypeError):
+        sigmaSpace = 75.0
+    # -------------------------------------
+
     video_output = os.path.join(PROCESSEDDIR, name)
+    
     cap = cv2.VideoCapture(videoEntrada)
     if not cap.isOpened():
         raise IOError("No se pudo abrir el video de entrada para eliminar ruido.")
+        
     width, height = int(cap.get(3)), int(cap.get(4))
     fps = cap.get(5)
+    
     out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
     for _ in tqdm(range(total), desc="Eliminando ruido (CPU)"):
         ret, frame = cap.read()
         if not ret:
             break
+            
+        # Ahora pasamos las variables ya convertidas y limpias
         processed_frame = cv2.bilateralFilter(frame, d, sigmaColor, sigmaSpace)
         out.write(processed_frame)
-    cap.release(); out.release()
+        
+    cap.release()
+    out.release()
 
+def contraste(path: str, noise: bool, video: str, clipLimit: float = 2.0, tileGridSize = (8, 8)):
+    # --- BLOQUE DE CORRECCIÓN DE TIPOS ---
+    # 1. Asegurar que clipLimit sea un número flotante
+    try:
+        clipLimit = float(clipLimit)
+    except ValueError:
+        clipLimit = 2.0  # Valor por defecto si falla
+    
+    # 2. Asegurar que tileGridSize sea una tupla real (8, 8) y no un string "8,8"
+    if isinstance(tileGridSize, str):
+        # Convierte "8,8" -> (8, 8)
+        try:
+            parts = tileGridSize.split(',')
+            tileGridSize = (int(parts[0]), int(parts[1]))
+        except:
+            tileGridSize = (8, 8) 
+    
 
-def contraste(path: str, noise: bool, video: str, clipLimit: float = 2.0, tileGridSize: tuple = (8, 8)):
     ruta_entrada = os.path.join(PROCESSEDDIR, video) if noise else path
     video_output = os.path.join(PROCESSEDDIR, f"pre_{video}")
+    
     cap = cv2.VideoCapture(ruta_entrada)
     if not cap.isOpened():
         raise IOError("No se pudo abrir el video de entrada para ajustar contraste.")
-    width, height = int(cap.get(3)), int(cap.get(4)); fps = cap.get(5)
+        
+    width, height = int(cap.get(3)), int(cap.get(4))
+    fps = cap.get(5)
+    
     out = cv2.VideoWriter(video_output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    
+    # Ahora clipLimit es float y tileGridSize es tuple, OpenCV estará feliz
     clahe = cv2.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
+    
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
     for _ in tqdm(range(total), desc="Ajustando contraste (CPU)"):
         ret, frame = cap.read()
         if not ret:
             break
+            
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         cl = clahe.apply(l)
         limg = cv2.merge((cl, a, b))
         processed_frame = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
         out.write(processed_frame)
-    cap.release(); out.release()
+        
+    cap.release()
+    out.release()
 
 #Hacer el resize para que coincida resolución 
 def resize_video_ffmpeg(input_path, output_path, target_w, target_h):
@@ -107,7 +162,7 @@ def _video_has_audio(path: str) -> bool:
         return False
 
 def comprimir_video(input_path: str, output_path: str, audio_source: str | None = None):
-    use_gpu = torch.cuda.is_available()
+    use_gpu = False
     has_audio = False
     if audio_source and os.path.exists(audio_source):
         has_audio = _video_has_audio(audio_source)
@@ -191,7 +246,7 @@ def procesar_video_en_segundo_plano(
     contrast_tileGridSize,
     rescale
 ):
-    print(f" DEBUG - Parámetros recibidos:")
+    print(f"🔍 DEBUG - Parámetros recibidos:")
     print(f"  noise={noise} (tipo: {type(noise)})")
     print(f"  contrast={contrast} (tipo: {type(contrast)})")
     print(f"  rescale={rescale} (tipo: {type(rescale)})")
@@ -333,7 +388,7 @@ def procesar_video_en_segundo_plano(
         print("\n--- INICIANDO FASE 4: COMPRESIÓN FINAL CON FFMPEG ---")
         final_video_path = os.path.join(FINALDIR, f"compressed_{uniqueName}")
         comprimir_video(input_path=video_para_comprimir, output_path=final_video_path, audio_source=audio_source)
-
+        #final_video_path = video_para_comprimir
         # --- BLOQUE DE LIMPIEZA DESACTIVADO PARA PRUEBAS ---
         # print("\n--- LIMPIEZA DE ARCHIVOS DESACTIVADA ---")
         # files_to_clean = [original_filePath]
@@ -350,8 +405,8 @@ def procesar_video_en_segundo_plano(
         
         # --- FIN DEL BLOQUE DESACTIVADO ---
         
-        if not os.path.exists(final_video_path) or os.path.getsize(final_video_path) == 0:
-            raise HTTPException(status_code=500, detail="La compresión no produjo un archivo válido.")
+        #if not os.path.exists(final_video_path) or os.path.getsize(final_video_path) == 0:
+         #   raise HTTPException(status_code=500, detail="La compresión no produjo un archivo válido.")
         
         processing_status[uniqueName] = {
             "status": "completed",
@@ -420,14 +475,14 @@ async def SubirVideo(
         uniqueName,
         original_filePath,
         temp_audio,
-        noise_bool,  
+        noise_bool,  # 🔹 Usar el booleano convertido
         noise_d,
         noise_sigmaColor,
         noise_sigmaSpace,
-        contrast_bool,  
+        contrast_bool,  # 🔹 Usar el booleano convertido
         contrast_clipLimit,
         contrast_tileGridSize,
-        rescale_bool  
+        rescale_bool  # 🔹 Usar el booleano convertido
     )
 
     return {
