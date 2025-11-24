@@ -28,10 +28,15 @@ VIDEODIR = os.path.join(BASE_DIR, "Uploads/")
 PROCESSEDDIR = os.path.join(BASE_DIR, "Process/")
 FINALDIR = os.path.join(BASE_DIR, "FinalCompressed/")
 
-PRESET_NVENC = 'medium'
-CQ_VALUE = '31'
-PRESET_CPU = 'veryfast'
-CRF_VALUE = '28'
+# ---  CAMBIOS APLICADOS AQUÍ  ---
+# GPU: 'p5' ofrece el mejor equilibrio velocidad/calidad. CQ 23 evita degradación estructural.
+PRESET_NVENC = 'p5'   
+CQ_VALUE = '23'       
+
+# CPU: 'medium' es el estándar de oro. CRF 22 es visualmente sin pérdidas.
+PRESET_CPU = 'medium' 
+CRF_VALUE = '22'      
+# ------------------------------------
 processing_status = {}
 
 @app.on_event("startup")
